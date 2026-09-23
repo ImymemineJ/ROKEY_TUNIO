@@ -25,19 +25,21 @@ import uuid
 from ament_index_python.packages import get_package_share_directory
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import JointState
 
 from tunio_interfaces.action import (AdjustPeg, PlayString, PreparePluck, RegisterPeg,
                                      ReturnHome, StrumAll)
+from tunio_interfaces.srv import CommandTuning
 from tunio_robot import grip_width as GW
 from tunio_robot import motion_primitives as MP
 from tunio_robot import peg_state as PS
 from tunio_robot import runlog as RL
 from tunio_robot import teach_points as TP
 from tunio_robot.motion_cancel import CancelSession, request_and_confirm_stop
+from tunio_robot.motion_pause import PauseControl
 
 
 def _plain(msg):
@@ -163,14 +165,35 @@ class RobotController(Node):
         if not all(math.isfinite(v) and v > 0 for v in
                    (self._stop_timeout, self._stop_interval)):
             raise ValueError('정지 확인 시간과 주기는 유한한 양수여야 한다')
+        self.declare_parameter('motion_position_tolerance_mm', .5)  # 실측 전 임시값
+        self.declare_parameter('motion_angle_tolerance_deg', .1)  # 실측 전 임시값
+        self._pause_control = None
+        self._paused_dry = threading.Event()
         if not self.dry_run:
-            from dsr_msgs2.srv import CheckMotion, MoveStop
+            from dsr_msgs2.srv import CheckMotion, GetRobotState, MovePause, MoveResume, MoveStop
             stop_group = ReentrantCallbackGroup()
             prefix = f"/{self.points.robot['id']}/dsr_controller2/motion"
             self._stop_client = self.create_client(
                 MoveStop, prefix + '/move_stop', callback_group=stop_group)
             self._motion_client = self.create_client(
                 CheckMotion, prefix + '/check_motion', callback_group=stop_group)
+            pause = self.create_client(
+                MovePause, prefix + '/move_pause', callback_group=stop_group)
+            resume = self.create_client(
+                MoveResume, prefix + '/move_resume', callback_group=stop_group)
+            state = self.create_client(
+                GetRobotState, prefix.rsplit('/', 1)[0] + '/system/get_robot_state',
+                callback_group=stop_group)
+            self._pause_control = PauseControl(
+                pause, resume, self._motion_client, state, self._stop_timeout, self._stop_interval,
+                float(self.get_parameter('motion_position_tolerance_mm').value),
+                float(self.get_parameter('motion_angle_tolerance_deg').value))
+        control_group = MutuallyExclusiveCallbackGroup()
+        self.create_service(CommandTuning, '/robot/pause', self.on_pause,
+                            callback_group=control_group)
+        self.create_service(CommandTuning, '/robot/resume', self.on_resume,
+                            callback_group=control_group)
+
         self._side = None          # 마지막으로 다녀온 헤드스톡 쪽
         # 지금 피크를 쥐고 있는지. 집기·반환 시점은 로봇이 스스로 판단하고
         # 서버는 지시하지 않는다 (CLAUDE.md 2절). 페그를 잡으려면 손가락이
@@ -256,6 +279,51 @@ class RobotController(Node):
                 return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
+    def _pause_check(self):
+        if self._recovery_required:
+            raise RuntimeError('취소/제어 실패 후에는 재개할 수 없다')
+        for session in list(self._cancel_sessions.values()):
+            session.check()
+
+    def _control_failed(self):
+        self._recovery_required = True
+        if self._pause_control is not None:
+            self._pause_control.failed = True
+        goal = getattr(self, '_active_goal', None)
+        if goal is not None and goal.is_active:
+            self.on_cancel(goal)
+
+    def on_pause(self, req, res):
+        try:
+            self._pause_check()
+            if self.dry_run:
+                self._paused_dry.set()
+            else:
+                self._pause_control.pause()
+            self._pause_check()
+            res.accepted = True
+            res.message = '일시정지 접수 — 후속 이동/I/O 차단'
+        except Exception as exc:
+            self._control_failed()
+            res.accepted = False
+            res.message = str(exc)
+        return res
+
+    def on_resume(self, req, res):
+        try:
+            self._pause_check()
+            if self.dry_run:
+                self._paused_dry.clear()
+            else:
+                self._pause_control.resume(self._pause_check)
+            res.accepted = True
+            res.message = '재개 접수'
+        except Exception as exc:
+            self._control_failed()
+            res.accepted = False
+            res.message = str(exc)
+        return res
+
     def on_cancel(self, goal_handle):
         with self._lock:
             if not goal_handle.is_active:
@@ -294,6 +362,7 @@ class RobotController(Node):
                 res.success = False
                 res.message = f"{self._running} 실행 중"
                 return res
+            self._active_goal = goal
             self._running = name
             if name != "play_string":
                 self._prepared_pluck = None
@@ -304,14 +373,28 @@ class RobotController(Node):
         failure = None
         if not self.dry_run:
             MP._cancel_check = session.check
+            MP._pause_control = getattr(self, '_pause_control', None)
         try:
             session.check()
+            if self.dry_run:
+                while self._paused_dry.is_set():
+                    session.check()
+                    time.sleep(self._stop_interval)
             work()
             session.check()
         except Exception as exc:                      # noqa: B902
             failure = exc
+            control = getattr(self, '_pause_control', None)
+            if control is not None and control.failed:
+                self._control_failed()
         finally:
-            session.work_done.set()
+            control = getattr(self, '_pause_control', None)
+            if control is not None:
+                # 취소와 재개가 겹쳐도 늦은 resume 응답 뒤에 마지막 Stop을 확인한다.
+                with control.lock:
+                    session.work_done.set()
+            else:
+                session.work_done.set()
         # 완료 판정과 취소 접수를 같은 락으로 직렬화한다.
         with self._lock:
             canceled = session.requested.is_set()
@@ -342,9 +425,11 @@ class RobotController(Node):
                 goal.abort()
         if not self.dry_run:
             MP._cancel_check = None
+            MP._pause_control = None
         with self._lock:
             self._cancel_sessions.pop(id(goal), None)
             self._running = None
+            self._active_goal = None
         took = time.time() - t0
         # 걸린 시간을 **항상** 남긴다. 서버의 play/adjust 타임아웃이 전부 임시값이고,
         # 특히 줄마다 첫 adjust_peg 는 안에서 Phase 0 를 돌아 훨씬 오래 걸린다.

@@ -856,3 +856,13 @@ colcon test --packages-select tunio_server && colcon test-result --all
 - MoveStop(mode=2) + CheckMotion(IDLE)로 실물 정지를 요청·확인한다. 이동용 DSR 래퍼와 분리된 ROS 클라이언트를 사용한다. 취소 후 추가 이동/그리퍼 I/O/자동 복귀를 막는다.
 - 정지·Action 종료 확인이 없으면 실패로 보고하며 새 실물 Action을 잠근다. 정상 취소 후에도 현장 접촉 상태 복구·노드 재시작 전에는 새 Action을 거부한다.
 - 정지 시간 5초·재확인 주기 0.1초는 조정 가능한 임시값이다. 물리 정지 지연·접촉 상태·힘 제어는 현장 검증 전이다. 자세한 계약과 한계는 TUNIO_INTERFACE_SPEC 및 실물_취소_정지_검증.md 참조.
+
+### 2026-09-23 사용자 요청: 이동 중 일시정지·재개
+
+- `/robot/pause`·`/robot/resume` CommandTuning을 추가한다. 두산 MovePause/MoveResume 및
+  GetRobotState로 연동하고 취소가 우선한다. 보호정지 자동 해제는 하지 않는다.
+- 동기 이동이 pause 서비스를 막는 드라이버 구조 때문에 일반 이동은 비동기+완료 확인을 쓴다.
+  radius 있는 발현 스트로크는 기존 경로 보존을 위해 동기로 유지한다. 힘 제어 중 pause는 정지로 전환한다.
+- 목표 도달 임시 허용값 0.5mm/0.1도는 파라미터이며 물리 정지 검증을 대신하지 않는다.
+- pause 중 로봇 결과 대기 예산을 멈추고 중단된 오디오는 재개 후 다시 측정한다.
+  세부 계약과 실기 전 한계는 docs/실물_일시정지_재개_검증.md를 따른다.

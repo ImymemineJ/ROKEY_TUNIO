@@ -21,7 +21,7 @@ def test_new_measurement_clears_live_value_but_keeps_string_results(next_string,
     before = deepcopy(rec)
     states = []
     node = SimpleNamespace(
-        current_string=6, measured_hz=81.36, measurement_valid=True,
+        _pause_confirmed=False, current_string=6, measured_hz=81.36, measurement_valid=True,
         adjust_count=0, results={6: rec})
     node._publish_state = lambda: states.append(
         (node.current_string, node.measured_hz, node.measurement_valid))
@@ -32,7 +32,7 @@ def test_new_measurement_clears_live_value_but_keeps_string_results(next_string,
 
 def test_same_string_adjustment_keeps_its_measurement():
     node = SimpleNamespace(
-        current_string=6, measured_hz=81.36, measurement_valid=True,
+        _pause_confirmed=False, current_string=6, measured_hz=81.36, measurement_valid=True,
         _publish_state=lambda: None)
     TM.TaskManager._set_phase(node, TM.TuningState.PHASE_ADJUST_PEG, 6)
     assert node.measured_hz == 81.36

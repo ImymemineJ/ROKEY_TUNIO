@@ -8,9 +8,10 @@ class MotionCancelled(Exception):
 
 
 class GuardedAPI:
-    def __init__(self, api, check):
+    def __init__(self, api, check, pause=None):
         self.api = api
         self.check = check
+        self.pause = pause
 
     def __getattr__(self, name):
         value = getattr(self.api, name)
@@ -22,7 +23,12 @@ class GuardedAPI:
             cleanup = name in ('release_force', 'release_compliance_ctrl')
             if not cleanup:
                 self.check()
-            result = value(*args, **kwargs)
+            if self.pause is not None and not cleanup:
+                result = self.pause.invoke(self.api, self.check, name, args, kwargs)
+            else:
+                result = value(*args, **kwargs)
+                if self.pause is not None and name == 'release_force' and result == 0:
+                    self.pause.force_active = False
             if not cleanup:
                 self.check()
             return result

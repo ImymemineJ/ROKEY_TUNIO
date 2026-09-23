@@ -12,7 +12,7 @@ def scenario(ready=True, outcomes=(True,)):
     calls = []
     outcomes = iter(outcomes)
     node = SimpleNamespace(
-        job_id='prepare-test', measurement_id=0, _registered_pegs={6},
+        _pause_epoch=0, job_id='prepare-test', measurement_id=0, _registered_pegs={6},
         active_settings=SimpleNamespace(measure_timeout_sec=10., onset_timeout_sec=10.),
         _cancel=threading.Event(), cli_prepare=object(), cli_play=object(),
         _gate=Mock(), _set_phase=Mock(), _track=Mock(), _untrack=Mock(),
@@ -26,7 +26,7 @@ def scenario(ready=True, outcomes=(True,)):
             calls.append('ready')
             feedback_callback(SimpleNamespace(feedback=SimpleNamespace(ready=True)))
         ok = next(outcomes)
-        result = SimpleNamespace(result=SimpleNamespace(
+        result = SimpleNamespace(done=lambda: True, result=SimpleNamespace(
             job_id=goal.job_id, string_number=goal.string_number,
             measurement_id=goal.measurement_id, success=ok, frequency_hz=82.4,
             failure_reason=TM.StringResult.FAIL_TIMEOUT if not ok else 0))
@@ -43,6 +43,7 @@ def scenario(ready=True, outcomes=(True,)):
         return SimpleNamespace(success=True)
 
     node._run_action = action
+    node._measure_attempt = lambda n: TM.TaskManager._measure_attempt(node, n)
     node._measure_once = lambda n: TM.TaskManager._measure_once(node, n)
     return node, calls
 
@@ -102,7 +103,7 @@ def test_no_ready_means_no_play():
 
 def test_cancel_after_preparation_never_opens_microphone():
     node, calls = scenario()
-    node._gate = Mock(side_effect=[None, TM.Cancelled()])
+    node._gate = Mock(side_effect=[None, None, TM.Cancelled()])
     with pytest.raises(TM.Cancelled):
         node._measure_once(6)
     assert calls == ['prepare_pluck']
