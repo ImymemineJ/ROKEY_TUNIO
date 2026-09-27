@@ -47,6 +47,9 @@
   peg_register_force:=true  페그 진입을 힘 제어로 (기본 false, #51)
   port:=9000      웹 포트
   db:=<경로>      SQLite 파일 위치
+  adaptive_gain:=false
+                  페그 효율 자동 보정 끄기 (기본 true — 작업 중 배운 효율을 조절 각도에 쓴다).
+                  실행 중에는 ros2 param set /task_manager adaptive_gain false
   save_on_error_exit:=true
                   중간에 끊긴 작업(PHASE_ERROR)도 DB 에 저장한다. 기본 false.
                   **true/false 로 적는다. 1/0 은 안 된다** — launch 가 INTEGER 로
@@ -74,6 +77,7 @@ def generate_launch_description():
     port = LaunchConfiguration('port')
     db = LaunchConfiguration('db')
     save_on_error = LaunchConfiguration('save_on_error_exit')
+    adaptive_gain = LaunchConfiguration('adaptive_gain')
 
     return LaunchDescription([
         DeclareLaunchArgument('dry_run', default_value='true',
@@ -91,6 +95,8 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'save_on_error_exit', default_value='false',
             description='끊긴 작업도 저장한다. 실측 회차용. 시연에서는 false'),
+        DeclareLaunchArgument('adaptive_gain', default_value='true',
+                              description='작업 중 배운 페그 효율을 조절 각도에 쓸지'),
 
         LogInfo(msg='[real_all] 가짜 노드가 없다. 페그 실측과 교시가 끝났는지 확인했는가.'),
         LogInfo(msg=['[real_all] dry_run=', dry_run,
@@ -108,7 +114,8 @@ def generate_launch_description():
         # measured 가 false 면 조절 단계에서 멈춘다. 그게 의도한 동작이다.
         Node(package='tunio_server', executable='task_manager', name='task_manager',
              output='screen',
-             parameters=[{'save_on_error_exit': save_on_error}]),
+             parameters=[{'save_on_error_exit': save_on_error,
+                          'adaptive_gain': adaptive_gain}]),
         Node(package='tunio_server', executable='result_store', name='result_store',
              output='screen', parameters=[{'db_path': db}]),
         Node(package='tunio_server', executable='web_node', name='web_node',
