@@ -548,6 +548,11 @@ function renderJobError(state) {
 
 function renderLive(state) {
   renderJobError(state);
+  // #88 로봇 알림(피크 없음·보충 대기 등). 로봇이 보낸 문장을 그대로 띄운다
+  const notice = $('robot-notice');
+  const text = (state && state.robot_notice) || '';
+  $('robot-notice-text').textContent = text;
+  notice.hidden = !text;
   markJustDone(state);
   $('job-id').textContent = state && state.job_id ? state.job_id : '작업 없음';
 

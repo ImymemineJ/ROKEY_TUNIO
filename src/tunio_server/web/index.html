@@ -31,7 +31,6 @@
 
 <!-- ─────────────────────────── 실시간 작업 ─────────────────────────── -->
 <section id="tab-live" class="panel active">
-
   <!-- 조작과 상태. 누를 수 있는 버튼만 또렷하게, 상태는 오른쪽에 크게 -->
   <div class="commandbar">
     <div class="cmd-group">
@@ -58,6 +57,9 @@
 
   <p id="registration-status" class="hint reg-hint" role="status" aria-live="polite">페그 재등록 후 시작하세요.</p>
   <div id="toast" class="toast"></div>
+  <div id="robot-notice" class="robot-notice" role="alert" hidden>
+    <span class="k">로봇 알림</span><span id="robot-notice-text"></span>
+  </div>
 
   <div class="stage">
 

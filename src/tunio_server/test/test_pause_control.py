@@ -20,6 +20,7 @@ def manager(control=None, running=True, confirmed=False):
         _cancel=threading.Event(), _pause=threading.Event(), _pause_epoch=0,
         _pause_confirmed=confirmed, _phase_before_pause=TuningState.PHASE_IDLE,
         phase=TuningState.PHASE_PLUCK, _control_error='',
+        _refill_wait=False, _resumed_since_play=threading.Event(),
         _publish_state=Mock(), _request_goal_cancel=Mock(), get_logger=lambda: Mock(),
         cli_pause=Mock(name='cli_pause'), cli_resume=Mock(name='cli_resume'))
     n._robot_control = control if control is not None else Mock()
@@ -139,10 +140,11 @@ def test_ready_wait_reacts_to_cancel_before_ready_timeout():
     cancel = threading.Event()
     n = Namespace(
         _gate=Mock(), _cancel=cancel, _pause=threading.Event(), job_id='j', measurement_id=0,
+        _resumed_since_play=threading.Event(), _set_robot_notice=Mock(),
         active_settings=Namespace(measure_timeout_sec=10.0, onset_timeout_sec=10.0),
         _p=lambda key: {'prepare_timeout_sec': 30.0, 'goal_response_sec': 5.0,
                         'ready_wait_sec': 10.0}[key],
-        _run_action=Mock(return_value=Namespace(success=True, preparation_id='p1')),
+        _run_action=Mock(return_value=Namespace(success=True, preparation_id='p1', message='')),
         cli_prepare=Mock(),
         _set_phase=Mock(), _track=Mock(), _untrack=Mock(), get_logger=lambda: Mock(),
         cli_measure=Namespace(send_goal_async=lambda goal, feedback_callback: send),

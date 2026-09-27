@@ -104,6 +104,10 @@ class ControlUnreachable(Exception):
     """
 
 
+class PickRefillRequired(Aborted):
+    """로봇이 빈손 재집기를 소진하고 홈 복귀를 완료했다."""
+
+
 class Measurement:
     """측정 1회의 결과. MeasurePitch Result 를 서버 관점으로 옮겨 담은 것."""
 
@@ -173,6 +177,9 @@ class TaskManager(Node):
         self._pause_epoch = 0
         self._control_error = ''
         self._pause_confirmed = False
+        self._resumed_since_play = threading.Event()
+        # #88 피크 보충 대기 중인가. 로봇은 이미 홈에서 멈춰 있어 재개에 로봇을 부르지 않는다
+        self._refill_wait = False
         self._cancel = threading.Event()
         self._active_goals = []
         self._registered_pegs = set()  # 이번 작업에서 성공 Result를 확인한 줄
@@ -313,7 +320,13 @@ class TaskManager(Node):
         msg.results = [self.results[s] for s in L.STRING_ORDER]
         msg.overall_result = L.overall_result([r.result for r in msg.results])
         msg.active_settings = self.active_settings if self.job_id else self.settings
+        msg.robot_notice = self.robot_notice
         self.pub_state.publish(msg)
+
+    def _set_robot_notice(self, message):
+        """로봇의 판정을 그대로 관제에 전달한다. 서버에서 폭을 재판정하지 않는다."""
+        self.robot_notice = message
+        self._publish_state()
 
     def _set_phase(self, phase, string_number=None):
         if self._pause_confirmed and phase not in (
@@ -337,6 +350,7 @@ class TaskManager(Node):
         self._publish_state()
 
     def _reset_results(self):
+        self.robot_notice = ''
         self.results = {}
         for s in L.STRING_ORDER:
             r = StringResult()
@@ -383,6 +397,8 @@ class TaskManager(Node):
         self._pause.clear()
         self._pause_confirmed = False
         self._control_error = ''
+        self._resumed_since_play.clear()
+        self._refill_wait = False
         self._cancel.clear()
         self.error_message = ''
         self._registered_pegs.clear()
@@ -492,8 +508,20 @@ class TaskManager(Node):
 
     def on_resume(self, req, res):
         with self._control_lock:
-            if (not self._running() or not self._pause_confirmed
-                    or self._cancel.is_set()):
+            if not self._running() or self._cancel.is_set():
+                res.message = '재개할 일시정지 작업이 없다'
+                return res
+            if self._refill_wait:
+                # #88 피크 보충 대기. 로봇은 홈에서 Action 없이 서 있으므로 부르지 않는다.
+                # 피크가 여전히 없으면 로봇이 다시 보충 대기를 돌려준다
+                self._resumed_since_play.set()
+                self.phase = self._phase_before_pause
+                self._pause.clear()
+                self._publish_state()
+                res.accepted = True
+                res.message = '피크 보충 확인 — 재개'
+                return res
+            if not self._pause_confirmed:
                 res.message = '재개할 일시정지 작업이 없다'
                 return res
             try:
@@ -501,6 +529,7 @@ class TaskManager(Node):
                 if self._cancel.is_set():
                     raise Cancelled()
                 self._pause_confirmed = False
+                self._resumed_since_play.set()   # 다음 준비/발현에서 로봇이 피크를 다시 본다 (#88)
                 self.phase = self._phase_before_pause
                 self._pause.clear()
                 self._publish_state()
@@ -638,6 +667,11 @@ class TaskManager(Node):
             self._untrack(handle)
         if self._cancel.is_set() and wrapped.status == GoalStatus.STATUS_CANCELED:
             raise Cancelled()
+        if (what in ('prepare_pluck', 'play_string')
+                and wrapped.status == GoalStatus.STATUS_ABORTED
+                and not wrapped.result.success
+                and getattr(wrapped.result, 'pick_refill_required', False)):
+            raise PickRefillRequired(wrapped.result.message)
         if wrapped.status != GoalStatus.STATUS_SUCCEEDED or not wrapped.result.success:
             raise Aborted('%s 실패(status=%s): %s — 후속 동작 중단'
                           % (what, wrapped.status, wrapped.result.message))
@@ -675,14 +709,40 @@ class TaskManager(Node):
     # ------------------------------------------------------------------ 측정 1회
 
     def _measure_once(self, string_number):
+        """일시정지가 끼어든 측정은 폐기하고, 피크 보충 대기(#88)는 측정 실패 횟수에 넣지 않는다."""
         while True:
             self._gate()
             epoch = self._pause_epoch
-            result = self._measure_attempt(string_number)
+            try:
+                result = self._measure_attempt(string_number)
+            except PickRefillRequired as exc:
+                self._wait_pick_refill(exc)
+                continue
             self._gate()
             if epoch == self._pause_epoch:
                 return result
             self.get_logger().info('일시정지가 끼어든 측정 폐기 — 재개 후 새로 발현/측정')
+
+    def _wait_pick_refill(self, exc):
+        """로봇이 빈손 재집기를 소진하고 홈 복귀를 마쳤다(#88). 사람이 피크를 채울 때까지 기다린다.
+
+        로봇 Action 은 이미 끝났고 팔은 홈에 서 있다. 그래서 로봇 일시정지 서비스를
+        부르지 않고 서버 안에서만 멈춘다. 웹의 재개는 on_resume 이 _refill_wait 를 보고
+        로봇 호출 없이 풀고, 다음 준비/발현 Goal 에 resumed=true 를 실어 보낸다.
+        """
+        self.measurement_valid = False
+        self.measured_hz = 0.0
+        with self._control_lock:
+            self._refill_wait = True
+            self._pause.set()
+            self._phase_before_pause = self.phase
+            self.phase = TuningState.PHASE_PAUSED
+        self._set_robot_notice(str(exc))
+        try:
+            self._gate()
+        finally:
+            self._refill_wait = False
+        self._set_robot_notice('')
 
     def _measure_attempt(self, string_number):
         """
@@ -694,11 +754,21 @@ class TaskManager(Node):
         # #89: 피크 집기·이동을 완료한 뒤 마이크 타이머를 시작한다.
         self._gate()
         self._set_phase(TuningState.PHASE_PREPARE_PLUCK, string_number)
-        prepared = self._run_action(
-            self.cli_prepare, PreparePluck.Goal(string_number=string_number),
-            float(self._p('prepare_timeout_sec')), 'prepare_pluck')
+        prepare_goal = PreparePluck.Goal(
+            string_number=string_number, resumed=self._resumed_since_play.is_set())
+        self._resumed_since_play.clear()
+        try:
+            prepared = self._run_action(
+                self.cli_prepare, prepare_goal,
+                float(self._p('prepare_timeout_sec')), 'prepare_pluck',
+                feedback_cb=lambda msg: self._set_robot_notice(msg.feedback.warning))
+        except Aborted as exc:
+            self._set_robot_notice(str(exc))
+            raise
         if prepared is None or not prepared.success or not prepared.preparation_id:
             raise Aborted('발현 준비 성공 식별자가 없다 — 측정·발현 요청 차단')
+        if prepared.message:
+            self._set_robot_notice(prepared.message)
         self._gate()  # 준비 중 취소/일시정지: 마이크와 발현을 시작하지 않는다
         target_hz = L.TARGETS[string_number][1]
         self.measurement_id += 1
@@ -744,13 +814,42 @@ class TaskManager(Node):
 
             # 발현. 마이크가 준비된 뒤에만 튕긴다 (명세 5.2)
             self._set_phase(TuningState.PHASE_PLUCK, string_number)
-            play = self._run_action(self.cli_play, PlayString.Goal(
-                string_number=string_number, preparation_id=prepared.preparation_id),
-                                    float(self._p('play_timeout_sec')), 'play_string')
-            play_ok = play is not None and play.success
-            if not play_ok:
-                why = play.message if play is not None else '응답 없음'
-                self.get_logger().error('%d번 줄 발현 실패: %s' % (string_number, why))
+            # 서버는 재개 사실만 전달한다. 피크 판정·알람·복귀는 로봇 내부 책임이다.
+            play_goal = PlayString.Goal(
+                string_number=string_number, resumed=self._resumed_since_play.is_set(),
+                preparation_id=prepared.preparation_id)
+            self._resumed_since_play.clear()
+            robot_warnings = set()
+
+            def on_robot_feedback(msg):
+                warning = msg.feedback.warning
+                if warning and warning not in robot_warnings:
+                    robot_warnings.add(warning)
+                    self.get_logger().warning('로봇 알림: %s' % warning)
+                    self._set_robot_notice(warning)
+
+            try:
+                play = self._run_action(self.cli_play, play_goal,
+                                        float(self._p('play_timeout_sec')), 'play_string',
+                                        feedback_cb=on_robot_feedback)
+            except PickRefillRequired:
+                # 이전 녹음이 끝났는지 확인한 뒤에만 보충 대기로 전환한다.
+                handle.cancel_goal_async()
+                finished = self._wait(result_future, float(self._p('cancel_wait_sec')),
+                                      '피크 보충 전 녹음 종료')
+                if finished is None:
+                    raise Aborted('녹음 종료 불명 — 피크 보충 후 자동 재개 차단')
+                raise
+            except Aborted as exc:
+                # #83은 실패 Result도 예외로 전달한다. 피드백 유실 시에도 사유를 표시하고
+                # 아직 기다리는 마이크를 취소한 뒤 후속 로봇 명령 없이 종료한다.
+                self._set_robot_notice(str(exc))
+                handle.cancel_goal_async()
+                raise
+            if play.message and play.message not in robot_warnings:
+                self._set_robot_notice(play.message)
+                # 성공 결과의 부가 알림은 표시만 한다.
+                self.get_logger().warning('로봇 동작 완료(경고): %s' % play.message)
 
             # 측정 결과 대기. 마이크가 onset 부터 timeout_sec 을 세므로
             # 서버는 onset 대기 + 측정 + 통신 여유만큼 기다린다
@@ -769,9 +868,6 @@ class TaskManager(Node):
                     raise Aborted('오디오 종료 불명 — 새 측정 차단')
             self._untrack(handle)
 
-        if not play_ok:
-            # 발현이 안 됐으면 측정값이 나와도 그 줄의 소리가 아니다
-            return Measurement(False, reason=StringResult.FAIL_ROBOT_ERROR)
         if wrapped is None:
             return Measurement(False, reason=StringResult.FAIL_TIMEOUT)
 

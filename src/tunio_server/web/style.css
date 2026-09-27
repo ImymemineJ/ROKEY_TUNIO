@@ -606,7 +606,7 @@ main { padding: 20px 24px 32px; max-width: 1320px; margin: 0 auto; }
   transition: color .2s;
 }
 .note.ok      { color: var(--ok); }
-.note.invalid { font-size: 24px; color: var(--text-faint); }
+.note.invalid { font-family: var(--sans); font-size: 18px; font-weight: 700; color: var(--text-faint); }  /* ±25 눈금 숫자 사이에 들어가게 작게 */
 
 .octave {
   font-family: var(--antique); font-weight: 700;
@@ -970,6 +970,29 @@ main { padding: 20px 24px 32px; max-width: 1320px; margin: 0 auto; }
   margin-top: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer;
   background: var(--bg-elev-2); color: var(--text);
   border: 1px solid var(--line); border-radius: 6px;
+}
+
+/* #88 로봇 알림 — 피크 없음·보충 대기처럼 사람이 손을 써야 하는 것. 호박색 띠 */
+.robot-notice {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 11px 16px;
+  border: 1px solid var(--edge-warn);
+  border-left: 5px solid var(--warn);
+  border-radius: var(--radius-sm);
+  background: var(--tint-warn);
+  color: var(--text);
+  white-space: pre-wrap;
+}
+.robot-notice[hidden] { display: none; }
+.robot-notice .k {
+  flex: none;
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: 13px;
+  color: var(--warn);
 }
 
 @media (prefers-reduced-motion: reduce) {
