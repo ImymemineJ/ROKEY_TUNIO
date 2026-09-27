@@ -27,7 +27,7 @@ def client(responses):
 
 
 def bind(node):
-    """SimpleNamespace 로 만든 노드에 on_goal 이 부르는 메서드 둘을 묶어 준다."""
+    """가짜 노드(SimpleNamespace)에 on_goal 이 부르는 메서드 둘을 묶어 준다."""
     node._notify = lambda message, error=True: RobotController._notify(node, message, error)
     node._reject = lambda reason: RobotController._reject(node, reason)
     return node
@@ -107,7 +107,7 @@ def test_robot_cancel_stops_and_latches_recovery(monkeypatch):
     monkeypatch.setattr(MP, '_cancel_check', None)
     node = bind(SimpleNamespace(
         _lock=threading.Lock(), _running=None, _cancel_sessions={},
-        _recovery_required=False, _prepared_pluck=None, _holding_pick=True,
+        _recovery_required=False, _prepared_pluck=None, _holding_pick=True, _pick_fault=None,
         dry_run=False, _stop_timeout=1, _stop_interval=.001, _service_wait=.01,
         _stop_client=Mock(), _motion_client=Mock(), _notice_pub=Mock(),
         get_logger=lambda: Mock(), _record=Mock()))
@@ -175,7 +175,7 @@ def test_goal_accepted_once_stop_services_match_within_wait():
 
 
 def test_stop_request_waits_for_service_instead_of_single_check():
-    """MoveStop 클라이언트가 아직 매칭 전이어도 deadline 안에 붙으면 정지를 보낸다."""
+    """정지(MoveStop) 클라이언트가 아직 매칭 전이어도 deadline 안에 붙으면 정지를 보낸다."""
     session = CancelSession()
     session.work_done.set()
     attempts = []

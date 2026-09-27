@@ -14,6 +14,8 @@ def wait_ready(client, timeout):
     2026-09-23 실기에서 목록 조회로는 보이던 서비스가 연결 검사 시점에 '미연결'로
     찍혀 작업이 통째로 중단됐다. 단 한 번 `service_is_ready()` 는 그 틈에 걸린다.
     """
+    if client is None:     # 만들지도 않았다 (dry_run 으로 시작한 노드) — 기다릴 것이 없다
+        return False
     return bool(client.wait_for_service(timeout_sec=max(0.0, float(timeout))))
 
 
@@ -66,8 +68,12 @@ def request_and_confirm_stop(stop, check_motion, session, timeout, interval):
     deadline = time.monotonic() + timeout
 
     def call(client, request):
-        if not wait_ready(client, deadline - time.monotonic()):
-            raise RuntimeError('정지/상태 서비스 연결 안 됨 (%.1f초 대기)' % timeout)
+        # 매칭 확인도 deadline 안에서 되풀이한다. 대기 함수가 기다리지 않고 바로 False 를
+        # 돌려주는 경우(매칭 틈·그래프 갱신 전)에도 한 번 보고 포기하지 않는다
+        while not wait_ready(client, min(interval * 10, max(0.0, deadline - time.monotonic()))):
+            if time.monotonic() >= deadline:
+                raise RuntimeError('정지/상태 서비스 연결 안 됨 (%.1f초 대기)' % timeout)
+            time.sleep(interval)
         future = client.call_async(request)
         done = threading.Event()
         future.add_done_callback(lambda _: done.set())

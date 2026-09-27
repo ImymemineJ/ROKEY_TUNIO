@@ -57,6 +57,10 @@ def test_pick_refill_through_resume_service(stage, outcome, cancel, monkeypatch)
                           cancel_callback=lambda goal: CancelResponse.ACCEPT,
                           callback_group=ReentrantCallbackGroup())
     robot.dry_run = False
+    # #106: 실물 모드 on_goal 은 두산 정지/상태 서비스를 기다린다. 이 시험은 dry_run 으로 만든
+    # 노드를 실물로 바꾸므로 그 클라이언트가 없다 — 붙어 있는 것으로 대역한다
+    robot._stop_client = Mock(wait_for_service=Mock(return_value=True))
+    robot._motion_client = Mock(wait_for_service=Mock(return_value=True))
     monkeypatch.setattr(robot.pegs, 'roll_of', lambda no: 0.0)
     robot._holding_pick = stage != 'pickup'
     failed_round = [GW.WidthError('통신 실패')] * 6 if outcome == 'unreadable' else [13.0] * 3

@@ -30,8 +30,8 @@ import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
-                       QoSReliabilityPolicy, qos_profile_sensor_data)
+from rclpy.qos import (qos_profile_sensor_data, QoSDurabilityPolicy, QoSHistoryPolicy,
+                       QoSProfile, QoSReliabilityPolicy)
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 
@@ -326,8 +326,10 @@ class RobotController(Node):
     def on_goal(self, goal_request):
         """이미 다른 동작이 돌고 있으면 받지 않는다. 팔이 하나라 겹칠 수 없다."""
         # 서비스 매칭 대기는 락 밖에서 한다. 락을 쥔 채 기다리면 그동안 취소 접수가 막힌다
-        if not self.dry_run and not (wait_ready(self._stop_client, self._service_wait)
-                                     and wait_ready(self._motion_client, self._service_wait)):
+        stop = getattr(self, '_stop_client', None)
+        motion = getattr(self, '_motion_client', None)
+        if not self.dry_run and not (wait_ready(stop, self._service_wait)
+                                     and wait_ready(motion, self._service_wait)):
             return self._reject(f'정지/상태 서비스 미연결 ({self._service_wait:.1f}초 대기). '
                                 '두산 컨트롤러 연결 확인')
         with self._lock:
