@@ -644,3 +644,31 @@ radius가 있는 발현 스트로크는 기존 동기 호출을 유지하므로 
 pause 시간은 로봇 Action 결과 대기 예산에서 제외한다. 중단된 측정은 완료/취소 응답을
 확인하고 버린 뒤 재개 후 새 준비·측정·발현으로 다시 잰다. 오디오 타이머는 바꾸지 않는다.
 물리 검증 한계·임시값·시험 절차: `실물_일시정지_재개_검증.md`.
+
+### 2026-09-27 서비스 매칭 대기와 `/robot/notice` (취소·일시정지 실기 후속)
+
+9/23 실기의 "일시정지/재개 서비스 미연결" 오류 종료와 "register_peg goal 거부"
+를 겨냥한 변경이다. 인터페이스 파일(msg/srv/action)은 바뀌지 않았고 토픽 하나가 늘었다.
+
+- **서비스 연결은 한 번 보고 포기하지 않는다.** PC 두 대 사이에서는 서비스가 떠 있어도
+  그 순간 매칭이 안 돼 있을 수 있어 `service_is_ready()` 한 번은 그 틈에 걸린다.
+  task_manager 는 `/robot/pause`·`resume` 을 `node_wait_sec`(5초) 동안,
+  robot_controller 는 goal 수락 전 MoveStop/CheckMotion 을 `service_wait_sec`(2초,
+  임시값) 동안, 정지·일시정지 경로의 두산 서비스는 각자의 deadline 안에서 기다린다.
+- **일시정지/재개 요청이 로봇에 닿지 못하면 거절만 한다** (`ControlUnreachable`).
+  로봇 상태가 안 바뀌었으므로 작업은 그대로 돈다. 일시정지 거절은 작업 계속,
+  재개 거절은 일시정지 유지다. **보낸 뒤** 무응답·거부만 취소로 전환한다(기존 동작).
+  일시정지 세대(`_pause_epoch`)는 로봇 확인 뒤에만 올려, 닿지도 못한 요청 때문에
+  진행 중이던 측정을 폐기하지 않는다.
+- **`/robot/notice`** · `std_msgs/String` · robot_controller → task_manager ·
+  reliable / transient local / depth 1 (`/tuning/state` 와 같은 QoS).
+  goal 을 거부한 사유("정지/상태 서비스 미연결", "취소/제어 실패 후 현장 복구
+  확인·재시작 필요", "'play_string' 실행 중")와 제어 잠금 사유를 싣는다. Action goal
+  거부에는 사유 필드가 없어 서버가 이걸 마지막으로 받은 값으로 `goal 거부 (로봇: …)`
+  문구를 만들고 `TuningState.error_message` 로 화면까지 올린다. 로봇 PC 로그를
+  열지 않고도 거부 원인을 본다.
+- 마이크 ready 대기(`ready_wait_sec` 10초) 중에도 취소를 본다. 그 전에는 이 구간에
+  누른 취소가 최대 10초 늦게 반응했다.
+- 웹 `robot_control_timeout_sec` 25 → 30초. 서버가 매칭 대기 5초 + 응답 대기 20초를
+  다 쓰면 25초라 웹이 먼저 끊을 수 있었다. 전부 실측 전 임시값.
+- 양쪽 PC 재빌드·노드 재시작이 필요하다(`std_msgs` 의존 추가). 실기 검증은 남아 있다.

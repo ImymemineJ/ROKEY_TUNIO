@@ -7,6 +7,16 @@ class MotionCancelled(Exception):
     pass
 
 
+def wait_ready(client, timeout):
+    """서비스가 붙을 때까지 timeout 초 기다린다. 한 번 보고 포기하지 않는다.
+
+    PC 두 대 사이에서는 서비스가 떠 있어도 그 순간 매칭이 안 돼 있을 수 있다.
+    2026-09-23 실기에서 목록 조회로는 보이던 서비스가 연결 검사 시점에 '미연결'로
+    찍혀 작업이 통째로 중단됐다. 단 한 번 `service_is_ready()` 는 그 틈에 걸린다.
+    """
+    return bool(client.wait_for_service(timeout_sec=max(0.0, float(timeout))))
+
+
 class GuardedAPI:
     def __init__(self, api, check, pause=None):
         self.api = api
@@ -56,8 +66,8 @@ def request_and_confirm_stop(stop, check_motion, session, timeout, interval):
     deadline = time.monotonic() + timeout
 
     def call(client, request):
-        if not client.service_is_ready():
-            raise RuntimeError('정지/상태 서비스 연결 안 됨')
+        if not wait_ready(client, deadline - time.monotonic()):
+            raise RuntimeError('정지/상태 서비스 연결 안 됨 (%.1f초 대기)' % timeout)
         future = client.call_async(request)
         done = threading.Event()
         future.add_done_callback(lambda _: done.set())

@@ -3,10 +3,12 @@ import math
 import threading
 import time
 
+from tunio_robot.motion_cancel import wait_ready
+
 
 def service_call(client, request, timeout):
-    if not client.service_is_ready():
-        raise RuntimeError('로봇 제어 서비스 미연결')
+    if not wait_ready(client, timeout):
+        raise RuntimeError('로봇 제어 서비스 미연결 (%.1f초 대기)' % timeout)
     future = client.call_async(request)
     done = threading.Event()
     future.add_done_callback(lambda _: done.set())

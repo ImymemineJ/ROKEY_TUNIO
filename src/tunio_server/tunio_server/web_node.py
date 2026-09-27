@@ -163,7 +163,10 @@ class WebNode(Node):
         self.declare_parameter('open_browser', True)
         self.declare_parameter('history_limit', 20)
         self.declare_parameter('service_timeout_sec', 5.0)
-        self.declare_parameter('robot_control_timeout_sec', 25.0)  # 실측 전 임시값
+        # task_manager 가 서비스 매칭 대기(node_wait_sec 5) + 로봇 응답 대기
+        # (robot_control_timeout_sec 20) 를 다 쓰면 25초라, 그보다 넉넉해야 응답이
+        # 오는 순간에 웹이 먼저 끊지 않는다. 실측 전 임시값
+        self.declare_parameter('robot_control_timeout_sec', 30.0)
 
         cb = ReentrantCallbackGroup()
         self.create_subscription(TuningState, '/tuning/state', self._on_state,

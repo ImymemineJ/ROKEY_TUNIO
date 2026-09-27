@@ -15,7 +15,7 @@ def client(function):
         future = Future()
         future.set_result(function(request))
         return future
-    return SimpleNamespace(service_is_ready=lambda: True, call_async=send)
+    return SimpleNamespace(wait_for_service=lambda timeout_sec=None: True, call_async=send)
 
 
 def control():

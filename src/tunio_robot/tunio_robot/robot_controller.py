@@ -27,8 +27,10 @@ import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
+                       QoSReliabilityPolicy, qos_profile_sensor_data)
 from sensor_msgs.msg import JointState
+from std_msgs.msg import String
 
 from tunio_interfaces.action import (AdjustPeg, PlayString, PreparePluck, RegisterPeg,
                                      ReturnHome, StrumAll)
@@ -38,8 +40,20 @@ from tunio_robot import motion_primitives as MP
 from tunio_robot import peg_state as PS
 from tunio_robot import runlog as RL
 from tunio_robot import teach_points as TP
-from tunio_robot.motion_cancel import CancelSession, request_and_confirm_stop
+from tunio_robot.motion_cancel import CancelSession, request_and_confirm_stop, wait_ready
 from tunio_robot.motion_pause import PauseControl
+
+# /robot/notice — goal 을 왜 거부했는지, 제어가 왜 잠겼는지를 서버로 보낸다.
+# Action goal 거부에는 사유 필드가 없어 서버 로그에 'goal 거부' 만 남고,
+# 로봇 PC 로그를 열어 보기 전에는 원인을 모른다 (2026-09-23 실기 — 등록 요청 직후
+# register_peg 거부, 관제 로그만으로 조건 확정 불가). transient local 이라
+# 서버가 늦게 구독해도 마지막 사유를 받는다.
+NOTICE_QOS = QoSProfile(
+    reliability=QoSReliabilityPolicy.RELIABLE,
+    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    depth=1,
+)
 
 
 def _plain(msg):
@@ -160,11 +174,16 @@ class RobotController(Node):
         self._recovery_required = False
         self.declare_parameter('cancel_stop_timeout_sec', 5.0)  # 실측 전 임시값
         self.declare_parameter('cancel_stop_interval_sec', 0.1)  # 실측 전 임시값
+        # goal 수락 전 정지/상태 서비스 매칭을 기다리는 시간. 서버의 goal_response_sec
+        # (5초) 보다 짧아야 수락 응답이 늦어 '수락 여부 불명' 으로 끝나지 않는다
+        self.declare_parameter('service_wait_sec', 2.0)  # 실측 전 임시값
         self._stop_timeout = float(self.get_parameter('cancel_stop_timeout_sec').value)
         self._stop_interval = float(self.get_parameter('cancel_stop_interval_sec').value)
+        self._service_wait = float(self.get_parameter('service_wait_sec').value)
         if not all(math.isfinite(v) and v > 0 for v in
-                   (self._stop_timeout, self._stop_interval)):
-            raise ValueError('정지 확인 시간과 주기는 유한한 양수여야 한다')
+                   (self._stop_timeout, self._stop_interval, self._service_wait)):
+            raise ValueError('정지 확인 시간과 주기, 서비스 대기는 유한한 양수여야 한다')
+        self._notice_pub = self.create_publisher(String, '/robot/notice', NOTICE_QOS)
         self.declare_parameter('motion_position_tolerance_mm', .5)  # 실측 전 임시값
         self.declare_parameter('motion_angle_tolerance_deg', .1)  # 실측 전 임시값
         self._pause_control = None
@@ -264,19 +283,30 @@ class RobotController(Node):
             MP._j6_sample = None
             self.get_logger().error(f"J6 감시 실패: {exc}")
 
+    def _notify(self, message, error=True):
+        """사유를 로그와 /robot/notice 에 같이 남긴다. 서버가 화면까지 올린다."""
+        (self.get_logger().error if error else self.get_logger().warn)(message)
+        try:
+            self._notice_pub.publish(String(data=message))
+        except Exception as exc:                          # noqa: BLE001
+            self.get_logger().warn(f'/robot/notice 발행 실패: {exc}')
+
+    def _reject(self, reason):
+        self._notify(f'새 동작 거부 — {reason}')
+        return GoalResponse.REJECT
+
     def on_goal(self, goal_request):
         """이미 다른 동작이 돌고 있으면 받지 않는다. 팔이 하나라 겹칠 수 없다."""
+        # 서비스 매칭 대기는 락 밖에서 한다. 락을 쥔 채 기다리면 그동안 취소 접수가 막힌다
+        if not self.dry_run and not (wait_ready(self._stop_client, self._service_wait)
+                                     and wait_ready(self._motion_client, self._service_wait)):
+            return self._reject(f'정지/상태 서비스 미연결 ({self._service_wait:.1f}초 대기). '
+                                '두산 컨트롤러 연결 확인')
         with self._lock:
             if self._recovery_required:
-                self.get_logger().error("취소 후 현장 복구 확인·노드 재시작 필요 — 새 동작 거부")
-                return GoalResponse.REJECT
-            if not self.dry_run and not (self._stop_client.service_is_ready()
-                                         and self._motion_client.service_is_ready()):
-                self.get_logger().error('정지/상태 서비스 미연결 — 새 동작 거부')
-                return GoalResponse.REJECT
+                return self._reject('취소/제어 실패 후 현장 복구 확인·robot_controller 재시작 필요')
             if self._running is not None:
-                self.get_logger().warn(f"'{self._running}' 실행 중이라 새 goal 을 거부한다")
-                return GoalResponse.REJECT
+                return self._reject(f"'{self._running}' 실행 중")
         return GoalResponse.ACCEPT
 
     def _pause_check(self):
@@ -285,8 +315,10 @@ class RobotController(Node):
         for session in list(self._cancel_sessions.values()):
             session.check()
 
-    def _control_failed(self):
+    def _control_failed(self, reason=''):
         self._recovery_required = True
+        self._notify('일시정지/재개 제어 실패 — 현장 복구 확인·robot_controller 재시작 전까지 '
+                     '새 동작을 받지 않는다' + (f': {reason}' if reason else ''))
         if self._pause_control is not None:
             self._pause_control.failed = True
         goal = getattr(self, '_active_goal', None)
@@ -304,7 +336,7 @@ class RobotController(Node):
             res.accepted = True
             res.message = '일시정지 접수 — 후속 이동/I/O 차단'
         except Exception as exc:
-            self._control_failed()
+            self._control_failed(str(exc))
             res.accepted = False
             res.message = str(exc)
         return res
@@ -319,7 +351,7 @@ class RobotController(Node):
             res.accepted = True
             res.message = '재개 접수'
         except Exception as exc:
-            self._control_failed()
+            self._control_failed(str(exc))
             res.accepted = False
             res.message = str(exc)
         return res
@@ -386,7 +418,7 @@ class RobotController(Node):
             failure = exc
             control = getattr(self, '_pause_control', None)
             if control is not None and control.failed:
-                self._control_failed()
+                self._control_failed(str(exc))
         finally:
             control = getattr(self, '_pause_control', None)
             if control is not None:

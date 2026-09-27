@@ -22,6 +22,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,
                        QoSProfile, QoSReliabilityPolicy)
+from std_msgs.msg import String
 
 from tunio_interfaces.action import (AdjustPeg, MeasurePitch, PlayString, PreparePluck,
                                      RegisterPeg, ReturnHome, StrumAll)
@@ -89,6 +90,14 @@ class Cancelled(Exception):
 
 class Aborted(Exception):
     """더 진행할 수 없는 오류. PHASE_ERROR 로 끝낸다."""
+
+
+class ControlUnreachable(Exception):
+    """로봇 일시정지/재개 서비스에 요청을 **보내지도 못했다.**
+
+    로봇 상태는 하나도 안 바뀌었으므로 작업을 죽일 이유가 없다. 요청을 거절하고
+    작업은 그대로 진행한다. 보낸 뒤 실패·무응답은 상태 불명이라 Aborted 다.
+    """
 
 
 class Measurement:
@@ -189,6 +198,12 @@ class TaskManager(Node):
         self.cli_resume = self.create_client(CommandTuning, '/robot/resume', callback_group=cb)
         self.cli_save = self.create_client(SaveJob, '/tuning/save_job', callback_group=cb)
 
+        # 로봇이 goal 을 거부하거나 제어를 잠근 사유. Action 거부에는 사유 필드가 없어
+        # 이 토픽이 없으면 화면에 'goal 거부' 만 남는다. QoS 는 로봇 쪽과 같아야 붙는다
+        self._robot_notice = ''
+        self.create_subscription(String, '/robot/notice', self._on_robot_notice,
+                                 STATE_QOS, callback_group=cb)
+
         self.pub_state = self.create_publisher(TuningState, '/tuning/state', STATE_QOS)
 
         # 명령 서비스. 시작·재등록·일시정지·재개·취소가 CommandTuning 타입을 공유하며
@@ -265,6 +280,10 @@ class TaskManager(Node):
             log.warning('  %s = %s' % (name, value))
 
     # ------------------------------------------------------------------ 상태 발행
+
+    def _on_robot_notice(self, msg):
+        self._robot_notice = msg.data
+        self.get_logger().warning('[로봇] %s' % msg.data)
 
     def _publish_state(self):
         """상태 발행은 전부 여기를 지난다. 주기 발행이 필요해지면 여기만 타이머로 감싼다.
@@ -396,13 +415,34 @@ class TaskManager(Node):
                 missing.append(name)
         return missing
 
-    def _robot_control(self, client):
-        if not client.service_is_ready():
-            raise Aborted('로봇 일시정지/재개 서비스 미연결 — 양쪽 PC 빌드·재시작 확인')
+    def _robot_control(self, client, what):
+        """로봇 일시정지/재개 서비스 왕복. 보내기 전 실패와 보낸 뒤 실패를 가른다.
+
+        한 번만 `service_is_ready()` 를 보면 PC 두 대 사이의 매칭 틈에 걸린다
+        (2026-09-23 실기 — 목록에는 보였는데 연결 검사 시점엔 '미연결'). 그래서
+        node_wait_sec 만큼 기다리고, 그래도 없으면 ControlUnreachable 로 **요청만
+        거절**한다. 요청을 보낸 뒤 무응답·거부는 로봇 상태를 모르는 것이라 Aborted 다.
+        """
+        wait = float(self._p('node_wait_sec'))
+        if not client.wait_for_service(timeout_sec=wait):
+            raise ControlUnreachable(
+                '로봇 %s 서비스 미연결 (%.1f초 대기) — 로봇 PC 의 robot_controller 가 '
+                '같은 브랜치로 빌드·실행 중인지 확인' % (what, wait))
         response = self._wait(client.call_async(CommandTuning.Request()),
-                              float(self._p('robot_control_timeout_sec')), '로봇 제어')
-        if response is None or not response.accepted:
-            raise Aborted(response.message if response else '로봇 제어 응답 없음')
+                              float(self._p('robot_control_timeout_sec')), '로봇 %s' % what)
+        if response is None:
+            raise Aborted('로봇 %s 응답 없음 — 로봇 상태 불명' % what)
+        if not response.accepted:
+            raise Aborted(response.message or '로봇 %s 거부' % what)
+
+    def _control_lost(self, what, exc):
+        """보낸 뒤 실패. 로봇 상태를 모르므로 취소로 전환한다."""
+        self._control_error = '%s 확인 실패: %s' % (what, exc)
+        self.get_logger().error(self._control_error)
+        self._cancel.set()
+        self._pause.clear()
+        self._request_goal_cancel()
+        return self._control_error
 
     def on_pause(self, req, res):
         with self._control_lock:
@@ -412,12 +452,15 @@ class TaskManager(Node):
             if self._pause.is_set():
                 res.message = '이미 일시정지 처리 중이다'
                 return res
+            # 로봇 응답 전에도 작업 스레드가 다음 Action 을 시작하지 못하게 먼저 막는다
             self._pause.set()
-            self._pause_epoch += 1
             try:
-                self._robot_control(self.cli_pause)
+                self._robot_control(self.cli_pause, '일시정지')
                 if self._cancel.is_set():
                     raise Cancelled()
+                # 확인된 뒤에만 세대를 올린다. 로봇에 닿지도 못한 일시정지 때문에
+                # 진행 중이던 측정을 폐기하고 다시 튕기지 않는다
+                self._pause_epoch += 1
                 self._pause_confirmed = True
                 self._phase_before_pause = self.phase
                 self.phase = TuningState.PHASE_PAUSED
@@ -426,12 +469,13 @@ class TaskManager(Node):
                 res.message = '로봇 일시정지 접수 — 재개하면 이어서 진행합니다'
             except Cancelled:
                 res.message = '취소가 우선 처리되었습니다'
-            except Exception as exc:
-                self._control_error = '일시정지 확인 실패: ' + str(exc)
-                self._cancel.set()
+            except ControlUnreachable as exc:
+                # 로봇에 아무것도 안 갔다. 작업은 계속 돌고 사용자는 다시 누르거나 취소한다
                 self._pause.clear()
-                self._request_goal_cancel()
-                res.message = self._control_error
+                self.get_logger().error('일시정지 거절: %s' % exc)
+                res.message = '일시정지 거절 — %s' % exc
+            except Exception as exc:                          # noqa: BLE001
+                res.message = self._control_lost('일시정지', exc)
             return res
 
     def on_resume(self, req, res):
@@ -441,7 +485,7 @@ class TaskManager(Node):
                 res.message = '재개할 일시정지 작업이 없다'
                 return res
             try:
-                self._robot_control(self.cli_resume)
+                self._robot_control(self.cli_resume, '재개')
                 if self._cancel.is_set():
                     raise Cancelled()
                 self._pause_confirmed = False
@@ -452,12 +496,12 @@ class TaskManager(Node):
                 res.message = '로봇 재개 접수'
             except Cancelled:
                 res.message = '취소가 우선 처리되었습니다'
-            except Exception as exc:
-                self._control_error = '재개 확인 실패: ' + str(exc)
-                self._cancel.set()
-                self._pause.clear()
-                self._request_goal_cancel()
-                res.message = self._control_error
+            except ControlUnreachable as exc:
+                # 로봇은 여전히 멈춰 있다. 일시정지 상태를 유지하고 다시 누르게 한다
+                self.get_logger().error('재개 거절: %s' % exc)
+                res.message = '재개 거절 — 일시정지 유지. %s' % exc
+            except Exception as exc:                          # noqa: BLE001
+                res.message = self._control_lost('재개', exc)
             return res
 
     def on_cancel(self, req, res):
@@ -560,7 +604,9 @@ class TaskManager(Node):
         if handle is None:
             raise Aborted('%s 수락 여부 불명 — 후속 동작 중단' % what)
         if not handle.accepted:
-            raise Aborted('%s goal 거부 — 후속 동작 중단' % what)
+            notice = getattr(self, '_robot_notice', '')
+            raise Aborted('%s goal 거부 — 후속 동작 중단%s'
+                          % (what, (' (로봇: %s)' % notice) if notice else ''))
         self._track(handle)
         try:
             # 수락 응답을 기다리는 사이 취소가 들어온 경우도 전달한다.
@@ -669,14 +715,20 @@ class TaskManager(Node):
         result_future = handle.get_result_async()
 
         try:
-            if not ready.wait(float(self._p('ready_wait_sec'))):
-                self.get_logger().error('마이크 ready feedback 이 오지 않았다')
-                handle.cancel_goal_async()
-                return Measurement(False, reason=StringResult.FAIL_TIMEOUT)
-
+            # ready 를 통째로 기다리면 그 사이(최대 ready_wait_sec) 취소가 안 먹는다.
+            # 잘게 자면서 취소를 본다 — 웹 취소가 늦게 반응하던 지점 하나
+            deadline = time.monotonic() + float(self._p('ready_wait_sec'))
+            while not ready.is_set() and not self._cancel.is_set():
+                ready.wait(min(0.05, max(0.0, deadline - time.monotonic())))
+                if time.monotonic() >= deadline:
+                    break
             if self._cancel.is_set():
                 handle.cancel_goal_async()
                 raise Cancelled()
+            if not ready.is_set():
+                self.get_logger().error('마이크 ready feedback 이 오지 않았다')
+                handle.cancel_goal_async()
+                return Measurement(False, reason=StringResult.FAIL_TIMEOUT)
 
             # 발현. 마이크가 준비된 뒤에만 튕긴다 (명세 5.2)
             self._set_phase(TuningState.PHASE_PLUCK, string_number)
