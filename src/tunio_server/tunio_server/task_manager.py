@@ -10,6 +10,8 @@ robot_controller 도 같은 구조라 결이 맞고, "지금 어느 단계냐"�
 근거: CLAUDE.md 11절, docs/task_manager_구현_브리핑.md
 """
 from datetime import datetime
+import json
+import os
 import threading
 import time
 
@@ -76,6 +78,8 @@ KEEP_TUNED_RESULT_ON_VERIFY_MEASURE_FAILURE = True
 #     OVERALL_PENDING 을 낸다. 실패가 아니라 '판정 전'으로 저장된다
 
 _POLICY_NOTES = (
+    ('페그 효율 자동 보정 범위 (tuning_logic.GAIN_MIN~MAX)', '%.1f~%.1f' % (L.GAIN_MIN, L.GAIN_MAX)),
+    ('페그 효율 자동 보정 무게 (GAIN_ALPHA)', L.GAIN_ALPHA),
     ('B1-1 조절 후 측정 재시도 리셋', MEASURE_RETRY_RESET_AFTER_ADJUST),
     ('B2-1 발현 실패를 측정 재시도로 계산', PLAY_FAILURE_COUNTS_AS_MEASURE_RETRY),
     ('B3-1 페그 실패 시 그 줄만 포기', ADJUST_FAILURE_SKIPS_STRING_ONLY),
@@ -130,6 +134,9 @@ class TaskManager(Node):
         # 중간에 끊긴 작업(PHASE_ERROR)을 저장할지. 기본 False 는 확정 사항이다
         # (CLAUDE.md 13절 521~522행). 실측 회차에서만 켠다. 위 C5-1 주석과 이슈 #47 참조
         self.declare_parameter('save_on_error_exit', False)
+        # 조절마다 (명령 각도, 예상 변화, 실제 변화, 효율) 을 남기는 곳. yaml 의 cents_per_deg 를
+        # 사람이 고칠 근거다. 빈 문자열이면 남기지 않는다. robot_controller 의 runlog_dir 와 같은 자리
+        self.declare_parameter('adjust_log_dir', os.path.expanduser('~/.tunio/server_data'))
         self.declare_parameter(
             'strum_string_numbers', [],
             ParameterDescriptor(type=ParameterType.PARAMETER_INTEGER_ARRAY,
@@ -166,6 +173,8 @@ class TaskManager(Node):
         self.measurement_valid = False
         self.adjust_count = 0
         self.results = {}
+        self._gain = {}            # 줄 번호 -> 이번 작업에서 배운 페그 효율 (yaml 값 대비 배율)
+        self._adjust_log = []      # 이번 작업의 조절 기록 (adjust_log_dir 에 JSON 으로 남긴다)
 
         # --- 통신 ---
         cb = ReentrantCallbackGroup()
@@ -345,6 +354,9 @@ class TaskManager(Node):
         self.error_message = ''
         self._registered_pegs.clear()
         self._reset_results()
+        # 효율은 작업마다 1.0 에서 다시 배운다. 날마다 골무·파지가 달라 이월하지 않는다
+        self._gain = {}
+        self._adjust_log = []
         self.job_id = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.measurement_id = 0
         self.adjust_count = 0
@@ -690,6 +702,7 @@ class TaskManager(Node):
         self.adjust_count = 0
         # 현재 줄 전환은 _set_phase에서 측정값 초기화와 함께 수행한다.
         retry_budget = self.active_settings.max_measure_retry
+        pending = None     # 방금 한 조절. 다음 유효 측정으로 효율을 배운다
 
         while True:
             self._gate()
@@ -698,6 +711,8 @@ class TaskManager(Node):
                 retry_budget = max(0, retry_budget - used)
 
             if not m.ok:
+                if pending is not None:
+                    self._learn_gain(pending, None)
                 rec.result = StringResult.RESULT_FAILED
                 rec.failure_reason = m.reason
                 rec.adjust_count = self.adjust_count
@@ -708,6 +723,9 @@ class TaskManager(Node):
             rec.has_tuned_hz = True
             rec.final_error_cents = L.error_cents(m.hz, target_hz)
             rec.adjust_count = self.adjust_count
+            if pending is not None:
+                self._learn_gain(pending, rec.final_error_cents)
+                pending = None
 
             if abs(rec.final_error_cents) <= self.active_settings.tolerance_cents:
                 rec.result = StringResult.RESULT_SUCCESS
@@ -725,7 +743,8 @@ class TaskManager(Node):
                 return
 
             self._gate()
-            if not self._adjust_peg(string_number, rec.final_error_cents):
+            done = self._adjust_peg(string_number, rec.final_error_cents)
+            if not done:
                 rec.result = StringResult.RESULT_FAILED
                 rec.failure_reason = StringResult.FAIL_ROBOT_ERROR
                 rec.adjust_count = self.adjust_count
@@ -736,6 +755,7 @@ class TaskManager(Node):
 
             self.adjust_count += 1
             rec.adjust_count = self.adjust_count
+            pending = done if isinstance(done, dict) else None
             # 조절이 끝난 직후에 알린다. 여기서 발행하지 않으면 다음 측정이 끝날 때까지
             # 화면의 조절 횟수가 그대로라, 측정값과 조절 횟수가 한꺼번에 바뀌는 것처럼
             # 보이고 페그를 돌리는 동안은 화면이 멈춘 것처럼 보인다.
@@ -754,8 +774,14 @@ class TaskManager(Node):
         except PC.CalibrationMissing as exc:
             raise Aborted('페그 회전량을 계산할 수 없다: %s' % exc)
 
+        gain = self._gain.get(string_number, 1.0)
+        plan = L.adjust_plan(err_cents, L.effective_cal(cal, gain))
+        if gain != 1.0:
+            self.get_logger().info('%d번 줄 페그 효율 %.2f 적용 (yaml 기울기 %.3f → %.3f 센트/도)'
+                                   % (string_number, gain, cal.cents_per_deg,
+                                      cal.cents_per_deg * gain))
         self._set_phase(TuningState.PHASE_ADJUST_PEG, string_number)
-        for direction, angle_deg in L.adjust_plan(err_cents, cal):
+        for direction, angle_deg in plan:
             self._gate()
             goal = AdjustPeg.Goal()
             goal.string_number = string_number
@@ -770,7 +796,56 @@ class TaskManager(Node):
                 why = res.message if res is not None else '응답 없음'
                 self.get_logger().error('페그 조절 실패: %s' % why)
                 return False
-        return True
+        return {'string_number': string_number, 'adjust_no': self.adjust_count + 1,
+                'err_before': err_cents, 'plan': plan, 'gain_used': gain, 'cal': cal}
+
+    # ------------------------------------------------------------------ 효율 학습·기록
+
+    def _learn_gain(self, done, err_after):
+        """조절 뒤 첫 측정으로 그 줄의 효율을 고치고 기록을 남긴다. err_after 가 None 이면 측정 실패."""
+        n = done['string_number']
+        if err_after is None:
+            gain, note = done['gain_used'], '건너뜀: 조절 뒤 측정 실패'
+        else:
+            gain, note = L.learn_gain(done['gain_used'], done['cal'], done['plan'],
+                                      done['err_before'], err_after)
+        self._gain[n] = gain
+        k = done['cal'].cents_per_deg
+        predicted = sum(d * a * k * done['gain_used'] for d, a in done['plan'])
+        entry = {
+            'time': datetime.now().isoformat(timespec='seconds'),
+            'string_number': n, 'adjust_no': done['adjust_no'],
+            'yaml_cents_per_deg': k, 'gain_used': round(done['gain_used'], 4),
+            'plan': [{'direction': int(d), 'deg': round(float(a), 3)} for d, a in done['plan']],
+            'err_before_cents': round(done['err_before'], 2),
+            'predicted_change_cents': round(predicted, 2),
+            'err_after_cents': None if err_after is None else round(err_after, 2),
+            'observed_change_cents': (None if err_after is None
+                                      else round(err_after - done['err_before'], 2)),
+            'gain_after': round(gain, 4), 'note': note,
+        }
+        self._adjust_log.append(entry)
+        self.get_logger().info('%d번 줄 조절 %d회차 결과 — 예상 %+.1f센트 / 실제 %s — %s'
+                               % (n, done['adjust_no'], predicted,
+                                  '측정 실패' if err_after is None
+                                  else '%+.1f센트' % (err_after - done['err_before']), note))
+        self._write_adjust_log()
+
+    def _write_adjust_log(self):
+        """이번 작업의 조절 기록을 통째로 덮어쓴다. 중간에 죽어도 그때까지가 남는다."""
+        folder = str(self._p('adjust_log_dir') or '')
+        if not folder:
+            return
+        try:
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, '%s_peg_adjust.json' % (self.job_id or 'nojob'))
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump({'job_id': self.job_id, 'records': self._adjust_log}, f,
+                          ensure_ascii=False, indent=1)
+            os.replace(tmp, path)
+        except Exception as exc:                          # noqa: BLE001
+            self.get_logger().warning('조절 기록을 남기지 못했다: %s' % exc)
 
     # ------------------------------------------------------------------ Phase 2
 

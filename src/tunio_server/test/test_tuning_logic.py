@@ -98,3 +98,43 @@ def test_overall():
 def test_overall_pending():
     assert L.overall_result([]) == TuningState.OVERALL_PENDING
     assert L.overall_result([S, P, S, S]) == TuningState.OVERALL_PENDING
+
+
+# ---------------------------------------------------------------- 작업 중 자동 보정
+
+def test_effective_cal_scales_only_cents_per_deg():
+    eff = L.effective_cal(CAL, 0.8)
+    assert eff.cents_per_deg == pytest.approx(4.0)
+    assert (eff.min_effective_deg, eff.max_angle_deg, eff.backlash_release_cents) == (
+        CAL.min_effective_deg, CAL.max_angle_deg, CAL.backlash_release_cents)
+
+
+def test_lower_gain_turns_further_for_same_error():
+    """효율이 낮게 배워지면 같은 오차에 더 많이 돌린다 — 덜 조여지던 문제를 메운다."""
+    (_, base), = L.adjust_plan(-10.0, CAL)
+    (_, more), = L.adjust_plan(-10.0, L.effective_cal(CAL, 0.8))
+    assert more == pytest.approx(base / 0.8)
+
+
+def test_learn_gain_moves_toward_observed_efficiency():
+    # 2도 조여 10센트를 기대했는데 7.5센트 올랐다 -> 관측 0.75, 무게 0.5 -> 0.875
+    gain, note = L.learn_gain(1.0, CAL, [(1, 2.0)], -12.0, -4.5)
+    assert gain == pytest.approx(1.0 - L.GAIN_ALPHA * 0.25)
+    assert '75%' in note
+
+
+def test_learn_gain_is_clamped():
+    gain, _ = L.learn_gain(1.0, CAL, [(1, 2.0)], -30.0, 0.0)     # 관측 3.0배
+    assert gain == pytest.approx(L.GAIN_MAX)
+    gain, _ = L.learn_gain(L.GAIN_MIN, CAL, [(1, 10.0)], -60.0, -56.0)   # 관측 0.08배
+    assert gain == pytest.approx(L.GAIN_MIN)
+
+
+@pytest.mark.parametrize('plan,before,after', [
+    ([(-1, 7.0), (1, 5.0)], 10.0, 2.0),     # 풀기→조임: 백래시가 섞여 배우지 않는다
+    ([(1, 2.0)], -12.0, -10.5),             # 변화 1.5센트: 측정 흔들림과 못 가른다
+    ([(1, 2.0)], -12.0, -14.0),             # 거꾸로 움직임: 이상치로 보고 건너뛴다
+])
+def test_learn_gain_skips_unreliable_cases(plan, before, after):
+    gain, note = L.learn_gain(0.9, CAL, plan, before, after)
+    assert gain == 0.9 and note.startswith('건너뜀')
