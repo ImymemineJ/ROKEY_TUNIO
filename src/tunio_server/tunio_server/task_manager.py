@@ -151,6 +151,10 @@ class TaskManager(Node):
         # 조절마다 (명령 각도, 예상 변화, 실제 변화, 효율) 을 남기는 곳. yaml 의 cents_per_deg 를
         # 사람이 고칠 근거다. 빈 문자열이면 남기지 않는다. robot_controller 의 runlog_dir 와 같은 자리
         self.declare_parameter('adjust_log_dir', os.path.expanduser('~/.tunio/server_data'))
+        # 작업 중 배운 페그 효율을 다음 조절 각도에 쓸지. false 면 yaml 기울기 그대로 돌린다
+        # (예전 동작). 배우기와 기록은 꺼도 계속한다. 조절마다 다시 읽으므로 실행 중에
+        # `ros2 param set /task_manager adaptive_gain false` 로 바로 끌 수 있다
+        self.declare_parameter('adaptive_gain', True)
         self.declare_parameter(
             'strum_string_numbers', [],
             ParameterDescriptor(type=ParameterType.PARAMETER_INTEGER_ARRAY,
@@ -991,7 +995,12 @@ class TaskManager(Node):
         except PC.CalibrationMissing as exc:
             raise Aborted('페그 회전량을 계산할 수 없다: %s' % exc)
 
-        gain = self._gain.get(string_number, 1.0)
+        learned = self._gain.get(string_number, 1.0)
+        adaptive = bool(self._p('adaptive_gain'))
+        gain = learned if adaptive else 1.0
+        if gain != learned:
+            self.get_logger().info('%d번 줄 페그 효율 보정 꺼짐 — 배운 값 %.2f 대신 yaml 기울기 그대로'
+                                   % (string_number, learned))
         plan = L.adjust_plan(err_cents, L.effective_cal(cal, gain))
         if gain != 1.0:
             self.get_logger().info('%d번 줄 페그 효율 %.2f 적용 (yaml 기울기 %.3f → %.3f 센트/도)'
@@ -1014,17 +1023,21 @@ class TaskManager(Node):
                 self.get_logger().error('페그 조절 실패: %s' % why)
                 return False
         return {'string_number': string_number, 'adjust_no': self.adjust_count + 1,
-                'err_before': err_cents, 'plan': plan, 'gain_used': gain, 'cal': cal}
+                'err_before': err_cents, 'plan': plan, 'gain_used': gain, 'cal': cal,
+                'gain_learned': learned, 'adaptive': adaptive}
 
     # ------------------------------------------------------------------ 효율 학습·기록
 
     def _learn_gain(self, done, err_after):
         """조절 뒤 첫 측정으로 그 줄의 효율을 고치고 기록을 남긴다. err_after 가 None 이면 측정 실패."""
         n = done['string_number']
+        # 배우기는 보정을 꺼도 이어 간다. 이번에 실제로 쓴 값(끄면 1.0)이 아니라 그때까지
+        # 배운 값에서 출발한다 — 관측 효율은 yaml 기준이라 어느 쪽으로 돌렸든 같은 뜻이다
+        prior = done.get('gain_learned', done['gain_used'])
         if err_after is None:
-            gain, note = done['gain_used'], '건너뜀: 조절 뒤 측정 실패'
+            gain, note = prior, '건너뜀: 조절 뒤 측정 실패'
         else:
-            gain, note = L.learn_gain(done['gain_used'], done['cal'], done['plan'],
+            gain, note = L.learn_gain(prior, done['cal'], done['plan'],
                                       done['err_before'], err_after)
         self._gain[n] = gain
         k = done['cal'].cents_per_deg
@@ -1033,6 +1046,7 @@ class TaskManager(Node):
             'time': datetime.now().isoformat(timespec='seconds'),
             'string_number': n, 'adjust_no': done['adjust_no'],
             'yaml_cents_per_deg': k, 'gain_used': round(done['gain_used'], 4),
+            'adaptive_gain': done.get('adaptive', True),
             'plan': [{'direction': int(d), 'deg': round(float(a), 3)} for d, a in done['plan']],
             'err_before_cents': round(done['err_before'], 2),
             'predicted_change_cents': round(predicted, 2),
