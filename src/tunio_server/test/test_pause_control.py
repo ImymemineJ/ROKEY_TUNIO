@@ -123,7 +123,7 @@ def test_robot_control_after_send_failure_is_aborted(reply):
 
 def test_rejected_goal_message_carries_robot_notice():
     """로봇이 /robot/notice 로 보낸 거부 사유가 오류 문구에 실려 화면까지 간다."""
-    n = Namespace(_wait=lambda *a: Namespace(accepted=False), _p=lambda key: 5,
+    n = Namespace(_gate=Mock(), _wait=lambda *a: Namespace(accepted=False), _p=lambda key: 5,
                   _robot_notice='새 동작 거부 — 취소/제어 실패 후 현장 복구 확인·robot_controller 재시작 필요')
     with pytest.raises(TM.Aborted, match='goal 거부.*재시작 필요'):
         TM.TaskManager._run_action(n, Mock(), object(), 120, 'register_peg')
@@ -143,6 +143,7 @@ def test_ready_wait_reacts_to_cancel_before_ready_timeout():
         _p=lambda key: {'prepare_timeout_sec': 30.0, 'goal_response_sec': 5.0,
                         'ready_wait_sec': 10.0}[key],
         _run_action=Mock(return_value=Namespace(success=True, preparation_id='p1')),
+        cli_prepare=Mock(),
         _set_phase=Mock(), _track=Mock(), _untrack=Mock(), get_logger=lambda: Mock(),
         cli_measure=Namespace(send_goal_async=lambda goal, feedback_callback: send),
         _wait=Mock(return_value=handle))
