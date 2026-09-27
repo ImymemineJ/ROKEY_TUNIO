@@ -486,16 +486,19 @@ function renderButtons(state) {
   $('registration-status').textContent = registration.message;
   $('btn-pause').disabled = blocked || !running || paused;
   $('btn-resume').disabled = blocked || !paused;
-  $('btn-cancel').disabled = blocked || !running;
+  $('btn-cancel').disabled = !streamReady || !running
+    || (commandPending && !['pause', 'resume'].includes(commandPending));
 }
 
 // ─────────────────────────────── 명령
 
 async function sendCommand(name) {
-  if (commandPending || !streamReady || !lastState) return;
+  if (!streamReady || !lastState) return;
+  if (commandPending && !(name === 'cancel'
+      && ['pause', 'resume'].includes(commandPending))) return;
   const registering = name === 'reregister_pegs';
   if ((registering || name === 'start') && (isRunning(lastState) || registration.busy)) return;
-  commandPending = true;
+  commandPending = name;
   if (registering) registration.begin(lastState);
   renderButtons(lastState);
   try {
@@ -517,7 +520,7 @@ async function sendCommand(name) {
     if (registering) registration.unknown('응답 유실 — 접수 여부를 확인할 수 없습니다. 상태와 로그를 확인하세요.');
     toast(`명령을 보내지 못했다: ${e}`, false);
   } finally {
-    commandPending = false;
+    if (commandPending === name) commandPending = false;
     renderButtons(lastState);
   }
 }

@@ -49,7 +49,7 @@ from rclpy.node import Node
 
 from tunio_interfaces.action import (AdjustPeg, MeasurePitch, PlayString, PreparePluck,
                                      RegisterPeg, ReturnHome, StrumAll)
-from tunio_interfaces.srv import SaveJob
+from tunio_interfaces.srv import CommandTuning, SaveJob
 
 # mode 파라미터 값
 MODE_ON_TARGET = 'on_target'   # 항상 목표 주파수를 낸다 -> 4줄 모두 조절 없이 성공
@@ -78,6 +78,7 @@ class FakeHardware(Node):
         self.declare_parameter('measure_delay_sec', 2.2)   # 녹음+분석 (기획 2.3)
         self.declare_parameter('prepare_delay_sec', 0.0)  # 준비 시간 재현용
         self._prepared_pluck = None
+        self._paused = threading.Event()
         self.declare_parameter('require_peg_registration', False)
         self._registered_strings = set()
         self.declare_parameter('play_delay_sec', 3.0)      # 피크 집기+접근+발현+후퇴 (추정)
@@ -117,6 +118,11 @@ class FakeHardware(Node):
         if bool(self.get_parameter('serve_measure').value):
             wanted.append((MeasurePitch, '/audio/measure_pitch', self.on_measure))
         if bool(self.get_parameter('serve_robot').value):
+            control_group = MutuallyExclusiveCallbackGroup()
+            self.create_service(CommandTuning, '/robot/pause', self.on_pause,
+                                callback_group=control_group)
+            self.create_service(CommandTuning, '/robot/resume', self.on_resume,
+                                callback_group=control_group)
             wanted += [(PreparePluck, '/robot/prepare_pluck', self.on_prepare_pluck),
                        (ReturnHome, '/robot/return_home', self.on_return_home),
                        (RegisterPeg, '/robot/register_peg', self.on_register),
@@ -208,8 +214,22 @@ class FakeHardware(Node):
 
     def on_cancel(self, goal):
         """취소를 수락한다. 진행 중인 동작은 다음 확인 지점에서 빠져나온다."""
+        if not isinstance(goal.request, MeasurePitch.Goal):
+            self._paused.clear()
         self.get_logger().info('취소 요청 수락')
         return CancelResponse.ACCEPT
+
+    def on_pause(self, req, res):
+        self._paused.set()
+        res.accepted = True
+        res.message = '가상 로봇 일시정지'
+        return res
+
+    def on_resume(self, req, res):
+        self._paused.clear()
+        res.accepted = True
+        res.message = '가상 로봇 재개'
+        return res
 
     def _sleep(self, goal, seconds) -> bool:
         """
@@ -224,6 +244,9 @@ class FakeHardware(Node):
         while remaining > 0.0:
             if goal.is_cancel_requested:
                 return False
+            if not isinstance(goal.request, MeasurePitch.Goal) and self._paused.is_set():
+                threading.Event().wait(step)
+                continue
             threading.Event().wait(min(step, remaining))
             remaining -= step
         return not goal.is_cancel_requested

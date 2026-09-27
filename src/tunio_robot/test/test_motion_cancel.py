@@ -23,7 +23,14 @@ def client(responses):
         if value is not None:
             f.set_result(value)
         return f
-    return SimpleNamespace(service_is_ready=lambda: True, call_async=send), calls
+    return SimpleNamespace(wait_for_service=lambda timeout_sec=None: True, call_async=send), calls
+
+
+def bind(node):
+    """SimpleNamespace 로 만든 노드에 on_goal 이 부르는 메서드 둘을 묶어 준다."""
+    node._notify = lambda message, error=True: RobotController._notify(node, message, error)
+    node._reject = lambda reason: RobotController._reject(node, reason)
+    return node
 
 
 def test_stop_mode_2_and_busy_then_idle():
@@ -98,11 +105,12 @@ def test_robot_cancel_stops_and_latches_recovery(monkeypatch):
         session.stop_done.set()
     monkeypatch.setattr('tunio_robot.robot_controller.request_and_confirm_stop', stop_request)
     monkeypatch.setattr(MP, '_cancel_check', None)
-    node = SimpleNamespace(
+    node = bind(SimpleNamespace(
         _lock=threading.Lock(), _running=None, _cancel_sessions={},
         _recovery_required=False, _prepared_pluck=None, _holding_pick=True,
-        dry_run=False, _stop_timeout=1, _stop_interval=.001,
-        _stop_client=Mock(), _motion_client=Mock(), get_logger=lambda: Mock(), _record=Mock())
+        dry_run=False, _stop_timeout=1, _stop_interval=.001, _service_wait=.01,
+        _stop_client=Mock(), _motion_client=Mock(), _notice_pub=Mock(),
+        get_logger=lambda: Mock(), _record=Mock()))
     goal = Mock(is_active=True)
     goal.canceled.side_effect = lambda: setattr(goal, 'is_active', False)
 
@@ -130,6 +138,64 @@ def test_robot_cancel_stops_and_latches_recovery(monkeypatch):
     assert node._recovery_required
     assert RobotController.on_goal(node, None).name == 'REJECT'
     assert RobotController.on_cancel(node, goal).name == 'REJECT'
+    # 거부 사유가 /robot/notice 로 나간다. 서버는 이걸로 '왜' 거부됐는지 화면에 올린다
+    notice = node._notice_pub.publish.call_args[0][0].data
+    assert '복구' in notice and '재시작' in notice
+
+
+def test_goal_rejected_when_stop_services_never_match_and_reason_is_published():
+    """정지/상태 서비스가 대기 시간 안에 안 붙으면 거부하고 사유를 발행한다.
+
+    한 번 보고 마는 service_is_ready() 대신 wait_for_service 로 기다린다 —
+    2026-09-23 실기에서 목록엔 보이던 서비스가 그 순간 매칭이 안 돼 거부됐다.
+    """
+    waits = []
+
+    def never(timeout_sec):
+        waits.append(timeout_sec)
+        return False
+    node = bind(SimpleNamespace(
+        _lock=threading.Lock(), _running=None, _recovery_required=False, dry_run=False,
+        _service_wait=.25, _stop_client=SimpleNamespace(wait_for_service=never),
+        _motion_client=Mock(), _notice_pub=Mock(), get_logger=lambda: Mock()))
+    assert RobotController.on_goal(node, None).name == 'REJECT'
+    assert waits == [.25]
+    assert '미연결' in node._notice_pub.publish.call_args[0][0].data
+
+
+def test_goal_accepted_once_stop_services_match_within_wait():
+    node = bind(SimpleNamespace(
+        _lock=threading.Lock(), _running=None, _recovery_required=False, dry_run=False,
+        _service_wait=.25,
+        _stop_client=SimpleNamespace(wait_for_service=lambda timeout_sec: True),
+        _motion_client=SimpleNamespace(wait_for_service=lambda timeout_sec: True),
+        _notice_pub=Mock(), get_logger=lambda: Mock()))
+    assert RobotController.on_goal(node, None).name == 'ACCEPT'
+    node._notice_pub.publish.assert_not_called()
+
+
+def test_stop_request_waits_for_service_instead_of_single_check():
+    """MoveStop 클라이언트가 아직 매칭 전이어도 deadline 안에 붙으면 정지를 보낸다."""
+    session = CancelSession()
+    session.work_done.set()
+    attempts = []
+
+    def late(timeout_sec):
+        attempts.append(timeout_sec)
+        return len(attempts) >= 2
+    calls = []
+
+    def send(req):
+        calls.append(req)
+        f = Future()
+        f.set_result(SimpleNamespace(success=True, status=0))
+        return f
+    stop = SimpleNamespace(wait_for_service=late, call_async=send)
+    check = SimpleNamespace(wait_for_service=lambda timeout_sec: True, call_async=send)
+    request_and_confirm_stop(stop, check, session, 1, .001)
+    # 첫 wait 은 False 였지만 두 번째에 붙어 정지가 나갔다 — 한 번 보고 포기하지 않는다
+    assert session.error is None
+    assert len(attempts) >= 2 and len(calls) >= 2
 
 
 def test_ros_cancel_reaches_canceled_result_without_real_robot():

@@ -1,11 +1,17 @@
 """시작 전 등록은 측정과 분리하고, 실패하면 발현에 진입하지 않는다."""
 import threading
-from types import SimpleNamespace
+from types import SimpleNamespace as Namespace
 from unittest.mock import Mock
 
 import pytest
 
 from tunio_server import task_manager as TM
+
+
+def SimpleNamespace(**kwargs):
+    defaults = {'_gate': Mock(), '_control_error': '', '_pause': threading.Event()}
+    defaults.update(kwargs)
+    return Namespace(**defaults)
 
 
 @pytest.fixture(autouse=True)
@@ -157,7 +163,7 @@ def test_next_robot_request_waits_for_success_result():
     n = SimpleNamespace(_p=lambda key: 2, _cancel=threading.Event(),
                         _track=Mock(), _untrack=Mock(),
                         get_logger=lambda: Mock())
-    n._wait = lambda *args: TM.TaskManager._wait(n, *args)
+    n._wait = lambda *args, **kw: TM.TaskManager._wait(n, *args, **kw)
     client = SimpleNamespace(send_goal_async=send)
 
     def run():

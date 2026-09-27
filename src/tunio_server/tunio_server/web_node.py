@@ -163,6 +163,10 @@ class WebNode(Node):
         self.declare_parameter('open_browser', True)
         self.declare_parameter('history_limit', 20)
         self.declare_parameter('service_timeout_sec', 5.0)
+        # task_manager 가 서비스 매칭 대기(node_wait_sec 5) + 로봇 응답 대기
+        # (robot_control_timeout_sec 20) 를 다 쓰면 25초라, 그보다 넉넉해야 응답이
+        # 오는 순간에 웹이 먼저 끊지 않는다. 실측 전 임시값
+        self.declare_parameter('robot_control_timeout_sec', 30.0)
 
         cb = ReentrantCallbackGroup()
         self.create_subscription(TuningState, '/tuning/state', self._on_state,
@@ -221,7 +225,9 @@ class WebNode(Node):
         여기서 spin 하면 안 된다(메인 스레드가 이미 spin 중이다). call_async 로 던지고
         Future 완료를 Event 로 기다린다 — task_manager 가 Action 을 기다리는 방식과 같다.
         """
-        timeout = float(self.get_parameter('service_timeout_sec').value)
+        parameter = ('robot_control_timeout_sec' if what in ('pause', 'resume')
+                     else 'service_timeout_sec')
+        timeout = float(self.get_parameter(parameter).value)
         if not client.wait_for_service(timeout_sec=1.0):
             raise ServiceUnavailable('%s 서비스를 찾을 수 없다 (노드가 떠 있는지 확인)' % what)
         done = threading.Event()
@@ -427,7 +433,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def _web_dir():
     """정적 파일 위치. colcon 이 share/tunio_server/web 으로 설치한다."""
-    return Path(get_package_share_directory('tunio_server')) / 'web'
+    installed = Path(get_package_share_directory('tunio_server')) / 'web'
+    index = installed / 'index.html'
+    # symlink-install은 개별 파일을 소스에 연결한다. 요청 경로 검사는 유지하고,
+    # 설치된 진입 파일을 기준으로 실제 정적 루트를 선택한다.
+    return index.resolve().parent if index.is_symlink() else installed
 
 
 def main():
