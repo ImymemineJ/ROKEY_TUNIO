@@ -6,6 +6,7 @@ task_manager가 이 함수들을 호출한다. 단위 테스트가 쉽도록 분
 열거값은 정의를 중복하지 않고 tunio_interfaces 메시지에서 직접 가져온다.
 메시지 모듈 import만 하므로 rclpy 초기화나 ROS 그래프 없이도 동작한다.
 """
+import dataclasses
 import math
 
 from tunio_interfaces.msg import StringResult, TuningState
@@ -88,6 +89,48 @@ def adjust_plan(err_cents: float, cal) -> list:
         # 푼 만큼 중 목표 아래로 내려간 몫만 조여 올린다
         plan.append(peg_angle(-cal.backlash_release_cents, cal))
     return plan
+
+
+# ---------------------------------------------------------------------------
+# 작업 중 자동 보정 (2026-09-27 사용자 결정 — '작업 중 자동 보정 + 기록')
+#
+# peg_cal 원자료를 다시 보니 2·1번은 yaml 의 cents_per_deg 만큼 음이 안 바뀐다
+# (2번 1.065 에 대해 반복 조임 0.76, 1번 0.502 에 대해 0.40 — 71%·80%). 그래서
+# "24도 조였는데 더 조여야 한다" 가 난다. 5번은 1.22~1.27 로 yaml(1.238)과 맞다.
+# 원인은 줄마다 다르고(고무 골무 비틀림·재파지 여유) 날마다 흔들려 yaml 값 하나로는
+# 못 잡는다. 그래서 조절할 때마다 실제로 변한 센트를 보고 그 줄의 효율(gain)을
+# 작업 안에서 고쳐 다음 조절에 쓴다. yaml 은 바꾸지 않는다 — 기록이 쌓이면 사람이 고친다.
+#
+# ⚠ 아래 숫자는 전부 실측 전 임시값이다 (CLAUDE.md 11절).
+GAIN_MIN = 0.5                  # 효율은 yaml 값의 0.5~1.5배 안에서만 움직인다
+GAIN_MAX = 1.5
+GAIN_ALPHA = 0.5                # 새 관측에 주는 무게. 1 이면 직전 한 번만 믿는다
+GAIN_MIN_OBSERVED_CENTS = 3.0   # 이보다 작은 변화는 측정 흔들림(±1~2센트)과 못 가른다
+
+
+def effective_cal(cal, gain: float):
+    """효율을 곱한 캘리브레이션. cents_per_deg 만 바뀌고 나머지 한계는 그대로다."""
+    return dataclasses.replace(cal, cents_per_deg=cal.cents_per_deg * float(gain))
+
+
+def learn_gain(gain: float, cal, plan: list, err_before: float, err_after: float) -> tuple:
+    """
+    조절 1회의 결과로 효율을 고친다. 반환 (새 gain, 사람이 읽을 사유).
+
+    cal 은 yaml 그대로의 값이다(효율을 곱하기 전). 관측 효율 = 실제 변화 / (cal 기울기 × 각도).
+    배우는 건 '조임 한 번' 짜리 조절뿐이다 — 풀기→조임 두 단계는 백래시가 섞여서
+    각도와 음 변화의 비를 가를 수 없다.
+    """
+    if len(plan) != 1 or plan[0][0] <= 0:
+        return gain, '건너뜀: 풀기→조임 조절은 백래시가 섞여 배우지 않는다'
+    deg = float(plan[0][1])
+    observed = float(err_after) - float(err_before)      # 조이면 음이 올라가 + 가 된다
+    if observed < GAIN_MIN_OBSERVED_CENTS:
+        return gain, '건너뜀: 변화 %+.1f센트는 측정 흔들림과 구분이 안 된다' % observed
+    ratio = observed / (cal.cents_per_deg * deg)
+    new = (1.0 - GAIN_ALPHA) * float(gain) + GAIN_ALPHA * ratio
+    new = min(GAIN_MAX, max(GAIN_MIN, new))
+    return new, '관측 효율 %.2f (예상의 %.0f%%) → gain %.2f' % (ratio, ratio * 100.0, new)
 
 
 def overall_result(results: list) -> int:
