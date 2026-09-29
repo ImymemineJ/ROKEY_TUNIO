@@ -21,6 +21,7 @@ def generate_launch_description():
     port = LaunchConfiguration('port')
     open_browser = LaunchConfiguration('open_browser')
     db = LaunchConfiguration('db')
+    adaptive_gain = LaunchConfiguration('adaptive_gain')
 
     return LaunchDescription([
         DeclareLaunchArgument('port', default_value='8080',
@@ -32,9 +33,12 @@ def generate_launch_description():
         # (bringup/station.launch.py 가 이걸 include 한다) 같은 인자를 둔다.
         DeclareLaunchArgument('db', default_value=os.path.expanduser('~/.tunio/tunio.db'),
                               description='SQLite 파일 위치'),
+        DeclareLaunchArgument('adaptive_gain', default_value='true',
+                              description='작업 중 배운 페그 효율을 조절 각도에 쓸지. '
+                                          'false 면 yaml 기울기 그대로(예전 동작)'),
 
         Node(package='tunio_server', executable='task_manager', name='task_manager',
-             output='screen'),
+             output='screen', parameters=[{'adaptive_gain': adaptive_gain}]),
         Node(package='tunio_server', executable='result_store', name='result_store',
              output='screen', parameters=[{'db_path': db}]),
         Node(package='tunio_server', executable='web_node', name='web_node',

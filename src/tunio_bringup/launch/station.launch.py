@@ -28,6 +28,8 @@ audio.launch.py 를 그대로 include 한다. 노드 정의를 복사하지 않�
   port:=9000       관제 웹 포트
   open_browser:=false
   db:=<경로>       SQLite 파일 위치
+  adaptive_gain:=false  페그 효율 자동 보정 끄기 (기본 true). 실행 중에는
+                   ros2 param set /task_manager adaptive_gain false
 
 ⚠ 로봇은 여기서 안 띄운다. 로봇 제어 PC 에서 따로 띄운다.
   한 PC 에 전부 물려 시험하려면 real_all.launch.py 를 쓴다.
@@ -58,6 +60,7 @@ def generate_launch_description():
                               description='관제 웹 포트. http://localhost:<port>'),
         DeclareLaunchArgument('open_browser', default_value='true'),
         DeclareLaunchArgument('db', default_value=os.path.expanduser('~/.tunio/tunio.db')),
+        DeclareLaunchArgument('adaptive_gain', default_value='true'),
 
         LogInfo(msg='[station] 마이크 + 서버 + 관제 웹. 로봇은 로봇 제어 PC 에서 따로 띄운다.'),
         LogInfo(msg=['[station] 관제 웹 http://localhost:', port]),
@@ -66,7 +69,8 @@ def generate_launch_description():
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(server_launch),
             launch_arguments={'port': port, 'open_browser': open_browser,
-                              'db': db}.items()),
+                              'db': db,
+                              'adaptive_gain': LaunchConfiguration('adaptive_gain')}.items()),
 
         # audio.launch.py 는 인자를 안 받아서(device 고정) 여기서 직접 띄운다.
         # 장치 번호를 실기에서 바꿔 가며 봐야 하기 때문이다.
