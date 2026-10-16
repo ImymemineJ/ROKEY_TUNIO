@@ -1,0 +1,90 @@
+TUNIO 진단 덤프 — hostname: rokey (실물 로봇 제어 PC)
+생성: 2026-09-30, 로봇 미동작 상태에서 수집
+
+⚠️ 비교 대상 docs/robot_data/2026-09-30_075927_env_dump_MS-01.txt 가
+저장소에 없다. 8절(MS-01과 다른 항목만 나열)은 대조 불가 — 아래는 이
+PC의 전체 값이며, MS-01 덤프가 오면 그때 대조한다.
+
+## 1. tunio_ws
+branch: feature/wipe-neck-cleaning
+commit: 86b3d167c0a0f7a623ae6aa860f437b96047f543
+uncommitted: docs/robot_data/*.json 3개(방금 생긴 wipe_check 결과, 추적 안 됨)
+
+ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+ROS_DISCOVERY_SERVER=172.24.2.65:11811
+ROS_DOMAIN_ID=10
+ROS_SUPER_CLIENT=TRUE
+RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+## 2. doosan-robot2 (ws_cobot_pjt/ws_dsr/src/doosan-robot2)
+branch: main
+commit: 4d5657f36a160eedb533ab1c975cd8a30c3e53b2
+uncommitted: 0
+
+## 3. DSR_ROBOT2.py
+경로: /home/rokey/ws_cobot_pjt/ws_dsr/src/doosan-robot2/dsr_common2/imp/DSR_ROBOT2.py
+sha256: 4ecf1fe60683f8876d6182bdbdd4e005a3382a541f91501f48fb9a68f75cc050
+mtime: 2026-09-16 16:00:25
+
+get_tool_force(ref) — DR_BASE/DR_TOOL/DR_WORLD 인자 받고 GetToolForce 서비스 호출.
+  service 실패/미성공 시 -1을 반환(예외로 안 죽고 로그만 warn/error).
+set_desired_force(fd, dir, time, mod) — mod 기본값 DR_FC_MOD_ABS. ref는 파라미터로
+  안 받고 전역 _g_coord(set_ref_coord로 설정된 값)를 그대로 쓴다.
+DR_FC_MOD_REL = 1 (dsr_common2/imp/DSR_ROBOT2.py:364)
+
+## 4. GetToolForce.srv
+경로: dsr_msgs2/srv/GetToolForce.srv (src·install 두 곳 동일)
+int8 ref  (DR_BASE(0), DR_TOOL(1), DR_WORLD(2))
+---
+float64[6] tool_force
+bool success
+주석: "힘은 base 좌표 기준, 모멘트는 tool 좌표 기준" — ref를 뭘 넣어도
+  힘 성분 자체는 base 기준이라는 뜻으로 읽힌다.
+
+## 5. motion_primitives.py 함수별 sha256 (앞 16자)
+_wipe_stroke:  a8796aba1c7147e1  (4883 bytes) — 9/23 원본으로 되돌린 상태(동기/비동기 분리 없음)
+wipe_strings:  a2e86eee4618cb2c  (2973 bytes) — XY먼저 재적용 버전(안전 Z→XY→pick_up)
+compliance:    cb080deb3e9aac20  (555 bytes)
+pick_up:       98bf67ed4f22df6e  (3994 bytes)
+pick_return:   a5a46fb16934820b  (2518 bytes)
+_movel_base:   60be48dc7cc955a3  (442 bytes)
+_amovel_base:  0657a351e52b716a  (635 bytes)
+
+## 6. teach_points.yaml — wipe/compliance/speed 값
+wipe_press_force_n: 20.0
+wipe_press_depth_mm: 40.0   ⚠️ 주석은 "동기10+비동기30 합"인데 _wipe_stroke가
+  9/23 원본(동기 분리 없음)으로 되돌아가 있어, 실제로는 40mm 전체를 단일
+  비동기 이동으로 시도한다. wipe_press_sync_depth_mm(10.0)은 지금 코드가
+  안 읽는 죽은 값. 이 PC에서 아직 정리 안 한 불일치다.
+wipe_max_force_n: 100.0
+wipe_poll_sec: 0.2
+wipe_arrive_tolerance_n: 1.0
+wipe_arrive_confirm_polls: 3
+wipe_settle_sec: 20.0
+wipe_vel: 30.0 / wipe_acc: 50.0
+compliance_stx: [1000.0, 200.0, 1000.0, 50.0, 50.0, 50.0]
+motion.speed_scale: 6.0
+
+wipe 좌표 (전부 tcp: "GripperDA_v1"):
+  pickup.x = [590.0, 223.5, 50.0, 90.0, -180.0, -90.0]
+  start.x  = [415.0, -6.0, 194.0, 0.0, -180.0, -180.0]  (Z +10, 2026-09-29)
+  end.x    = [664.0, -6.0, 184.0, 0.0, -180.0, -180.0]
+  return_box.x = [558.0, 97.0, 220.0, 180.0, -180.0, 180.0]
+
+## 7. 실기 값(Doosan bringup 미가동 — 로봇을 움직이지 않기 위해 라이브 조회 생략)
+확인: `ros2 service list`에 get_tool_force/get_tcp/get_current_posx 등 관련
+서비스가 하나도 안 보임 → 이 PC에서 두산 브링업이 지금 안 떠 있다.
+그래서 get_tool()/get_tcp()/get_workpiece_weight()/get_current_posx(DR_BASE)/
+get_tool_force(DR_BASE)/get_tool_force(DR_TOOL) 3회 반복 조회는 생략했다.
+(브링업을 띄우면서까지 값을 낼 필요가 있으면 알려줄 것 — 그 경우도 로봇은
+안 움직이는 읽기 전용 호출만 하면 된다.)
+
+## 8. 최근 wipe_check.json 성공 회차 (이 PC, 오늘)
+2026-09-30_073433_wipe_check.json
+2026-09-30_073634_wipe_check.json
+2026-09-30_073802_wipe_check.json (최신)
+  press_n: 20.0 / settle_sec: 20.0 / ok: true
+  steps: pick_up → lift_to_travel_z → approach_start → wipe_stroke → retreat → pick_return
+※ 세 파일 모두 힘 시계열(스파이크/정착 로그)까지는 안 남기는 형식이라,
+  "20N까지 잘 갔는지"는 이 JSON만으로는 안 보인다 — 사용자가 이전에 붙여준
+  터미널 로그(스파이크 41N → 6~8N대 정착)가 그 시계열의 유일한 기록이다.
